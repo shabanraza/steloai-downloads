@@ -1,0 +1,145 @@
+name: Notarize macOS release assets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to process (defaults to latest release)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  notarize-macos-assets:
+    runs-on: macos-latest
+    env:
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+      APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+      APPLE_DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      RELEASE_TAG_INPUT: ${{ github.event.inputs.tag }}
+    steps:
+      - name: Validate required secrets
+        run: |
+          set -euo pipefail
+          required=(
+            APPLE_ID
+            APPLE_APP_SPECIFIC_PASSWORD
+            APPLE_TEAM_ID
+            APPLE_CERT_P12_BASE64
+            APPLE_CERT_PASSWORD
+            APPLE_DEVELOPER_ID_APPLICATION
+            KEYCHAIN_PASSWORD
+          )
+          for key in "${required[@]}"; do
+            if [ -z "${!key:-}" ]; then
+              echo "Missing required secret: $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Resolve release tag
+        id: release_tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -n "${RELEASE_TAG_INPUT:-}" ]; then
+            echo "tag=${RELEASE_TAG_INPUT}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TAG="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq '.tagName')"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Install signing certificate
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/notarize.keychain-db"
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Download DMG assets from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/input work/output
+          gh release download "${{ steps.release_tag.outputs.tag }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern '*.dmg' \
+            --dir work/input
+
+          count="$(ls -1 work/input/*.dmg 2>/dev/null | wc -l | tr -d ' ')"
+          if [ "${count}" = "0" ]; then
+            echo "No DMG assets found for release ${{ steps.release_tag.outputs.tag }}" >&2
+            exit 1
+          fi
+
+      - name: Re-sign, notarize, and staple DMGs
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          for dmg in work/input/*.dmg; do
+            base_name="$(basename "$dmg")"
+            mount_point="/Volumes/SteloAI-${RANDOM}"
+            app_stage="$RUNNER_TEMP/app-stage-${RANDOM}"
+            mkdir -p "$app_stage"
+
+            hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg"
+            app_path="$(find "$mount_point" -maxdepth 1 -name '*.app' -print -quit)"
+            if [ -z "${app_path}" ]; then
+              hdiutil detach "$mount_point"
+              echo "No .app bundle found in $base_name" >&2
+              exit 1
+            fi
+
+            cp -R "$app_path" "$app_stage/"
+            hdiutil detach "$mount_point"
+
+            app_name="$(basename "$app_path")"
+            unsigned_app="$app_stage/$app_name"
+
+            xattr -cr "$unsigned_app"
+            codesign --force --deep --options runtime --timestamp \
+              --sign "$APPLE_DEVELOPER_ID_APPLICATION" \
+              "$unsigned_app"
+            codesign --verify --deep --strict --verbose=2 "$unsigned_app"
+
+            notarize_dmg="work/output/$base_name"
+            hdiutil create -volname "SteloAI" -srcfolder "$app_stage" -ov -format UDZO "$notarize_dmg"
+            codesign --force --timestamp --sign "$APPLE_DEVELOPER_ID_APPLICATION" "$notarize_dmg"
+
+            xcrun notarytool submit "$notarize_dmg" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+
+            xcrun stapler staple "$notarize_dmg"
+            xcrun stapler validate "$notarize_dmg"
+            spctl -a -vv -t open --context context:primary-signature "$notarize_dmg"
+          done
+
+      - name: Upload notarized DMGs to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ steps.release_tag.outputs.tag }}" work/output/*.dmg \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
